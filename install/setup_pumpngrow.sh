@@ -7,21 +7,17 @@
 # Offline / USB install: copy the whole install/ folder to the Pi, then
 #   bash ~/install/setup_pumpngrow.sh
 #
-# The release and the boot image come from the PUBLIC repository
-# BlessingQ/pump_n_grow_public, so no GitHub token is needed anywhere.
-# Progress is printed as [1/8] .. [8/8].
+# The release comes from the PUBLIC repository BlessingQ/pump_n_grow_public,
+# so no GitHub token is needed anywhere. Progress is printed as [1/7] .. [7/7].
+#
+# This installer never touches the boot chain (no Plymouth theme, no
+# initramfs rebuild): a broken initramfs leaves the panel unbootable, which is
+# far worse than a stock boot screen. install/splash/apply_boot_splash.sh
+# remains available as a separate, manual step for anyone who wants it.
 #
 # All output is ASCII-only on purpose: the Raspberry Pi framebuffer console
 # has no CJK font and renders non-ASCII text as garbage.
 set -euo pipefail
-
-# When run through "curl | bash" there is no script file on disk, so fall back
-# to ~/install as the working folder for the boot image assets.
-if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-else
-  SCRIPT_DIR="$HOME/install"
-fi
 
 # Keep the installed application outside the source checkout. This prevents a
 # source update or Git cleanup from deleting the executable or its launcher.
@@ -33,11 +29,7 @@ ASSET_NAME="${PUMPNGROW_UPDATE_ASSET:-pumpngrow-linux-arm64.zip}"
 CHECKSUM_NAME="${ASSET_NAME}.sha256"
 # Fixed download URLs: no API call, no rate limit, no authentication.
 RELEASE_BASE_URL="https://github.com/$RELEASE_REPOSITORY/releases/latest/download"
-RAW_BASE_URL="https://raw.githubusercontent.com/$RELEASE_REPOSITORY/main/install"
 DOWNLOAD_HOST='github.com'
-# Boot splash source folder. Leave empty to auto-detect the splash folder
-# next to this script (downloaded from the public repository when missing).
-SPLASH_SRC_DIR="${SPLASH_SRC_DIR:-}"
 # Raspberry Pi 5 onboard RTC: trickle-charge voltage for the official
 # rechargeable battery (uV). Use 0 for a non-rechargeable cell.
 RTC_CHARGE_UV="${PUMPNGROW_RTC_CHARGE_UV:-3000000}"
@@ -49,7 +41,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- progress helpers ------------------------------------------------------
-TOTAL=8
+TOTAL=7
 STEP=0
 if [ -t 1 ]; then C_STEP=$'\033[1;34m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'; C_END=$'\033[0m'
 else C_STEP=''; C_OK=''; C_WARN=''; C_END=''; fi
@@ -114,27 +106,11 @@ ok "Network reachable, $DOWNLOAD_HOST resolves"
 step 'Installing required packages'
 sudo -v
 sudo apt update || warn 'apt update reported errors; continuing with cached package lists'
-sudo apt install -y curl jq unzip libgtk-3-0 imagemagick plymouth
+sudo apt install -y curl jq unzip libgtk-3-0
 ok 'Packages ready'
 
-# --- 3) installer assets and latest version -------------------------------
-step 'Fetching installer assets and checking the latest release'
-# "curl | bash" has no install/ folder beside it: fetch the boot image and the
-# splash helper from the public repository so step 6 can use them.
-if [ ! -f "$SCRIPT_DIR/splash/splash.png" ]; then
-  mkdir -p "$SCRIPT_DIR/splash"
-  curl --fail --silent --show-error --location \
-    --connect-timeout 15 --retry 3 --retry-delay 2 \
-    --output "$SCRIPT_DIR/splash/splash.png" "$RAW_BASE_URL/splash/splash.png"
-  curl --fail --silent --show-error --location \
-    --connect-timeout 15 --retry 3 --retry-delay 2 \
-    --output "$SCRIPT_DIR/splash/apply_boot_splash.sh" "$RAW_BASE_URL/splash/apply_boot_splash.sh"
-  chmod +x "$SCRIPT_DIR/splash/apply_boot_splash.sh"
-  ok "Installer assets downloaded to: $SCRIPT_DIR/splash"
-else
-  ok "Using installer assets in: $SCRIPT_DIR/splash"
-fi
-
+# --- 3) latest version -----------------------------------------------------
+step 'Checking the latest release'
 # The tag is informational only (the download uses the fixed /latest/ URL).
 # Unauthenticated API calls are limited to 60/hour per IP; one call is fine.
 RELEASE_TAG="$(
@@ -201,85 +177,7 @@ fi
 mv "$NEXT_BUNDLE" "$BUNDLE_DIR"
 ok "Installed to: $BUNDLE_DIR"
 
-# --- 6) apply the boot splash screen ---------------------------------------
-step 'Applying boot splash screen'
-if [ -z "$SPLASH_SRC_DIR" ]; then
-  for d in "$SCRIPT_DIR/splash" "$HOME/install/splash" "$BUNDLE_DIR"; do
-    if [ -f "$d/splash.png" ]; then
-      SPLASH_SRC_DIR="$d"; break
-    fi
-  done
-fi
-APP_SPLASH_PNG="$APP_ROOT/splash.png"
-PIX_THEME_DIR='/usr/share/plymouth/themes/pix'
-PIX_SPLASH_PNG="$PIX_THEME_DIR/splash.png"
-PIX_RENDER_PNG="$APP_ROOT/pumpngrow-pix-splash.png"
-PIX_SPLASH_WIDTH=1024
-PIX_SPLASH_HEIGHT=600
-BOOT_CMDLINE=''
-for candidate in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
-  if [ -f "$candidate" ]; then
-    BOOT_CMDLINE="$candidate"
-    break
-  fi
-done
-if [ -n "$SPLASH_SRC_DIR" ]; then
-  ok "Boot splash source: $SPLASH_SRC_DIR"
-  # Copy the source so the launcher icon remains available after the installer
-  # folder has been removed.
-  if [ -f "$SPLASH_SRC_DIR/splash.png" ]; then
-    install -m 0644 "$SPLASH_SRC_DIR/splash.png" "$APP_SPLASH_PNG"
-  fi
-  if [ -f "$APP_SPLASH_PNG" ]; then
-    if [ ! -f "$PIX_SPLASH_PNG" ]; then
-      warn "Raspberry Pi OS pix theme was not found at: $PIX_SPLASH_PNG"
-      warn 'Skipping boot splash to avoid enabling a custom graphics path.'
-    else
-      # Use the Raspberry Pi OS supplied pix theme only.  In particular, do
-      # not run configure-splash or install a script theme: those paths enable
-      # an extra early-graphics renderer and have caused unreliable boots on
-      # some HMI panels.  The source logo is 1920x1080; make a smaller,
-      # opaque 1024x600 PNG so the native theme never has to decode it at the
-      # panel's full-HD size.
-      convert "$APP_SPLASH_PNG" \
-        -resize "${PIX_SPLASH_WIDTH}x${PIX_SPLASH_HEIGHT}" \
-        -background white -gravity center -extent "${PIX_SPLASH_WIDTH}x${PIX_SPLASH_HEIGHT}" \
-        -alpha off -strip -depth 8 "PNG24:$PIX_RENDER_PNG"
-      if [ ! -f "$PIX_THEME_DIR/splash.pumpngrow-original.png" ]; then
-        sudo cp "$PIX_SPLASH_PNG" "$PIX_THEME_DIR/splash.pumpngrow-original.png"
-      fi
-      sudo install -m 0644 "$PIX_RENDER_PNG" "$PIX_SPLASH_PNG"
-      sudo plymouth-set-default-theme -R pix
-      # Recent Raspberry Pi OS releases can load pix assets from initramfs.
-      # -R normally refreshes it, but update explicitly when it is available.
-      if command -v update-initramfs >/dev/null 2>&1; then
-        sudo update-initramfs -u || warn 'initramfs refresh failed; pix may update after the next kernel update.'
-      fi
-
-      # Disable the fullscreen_logo options left by older PumpnGrow installers
-      # that used rpi-splash-screen-support/configure-splash.  The native pix
-      # theme does not need them.
-      if [ -n "$BOOT_CMDLINE" ]; then
-        cmdline="$(sudo tr '\n' ' ' < "$BOOT_CMDLINE")"
-        cmdline="$(printf '%s\n' "$cmdline" | sed -E 's/(^| )fullscreen_logo_name=[^ ]+//g; s/(^| )fullscreen_logo=[^ ]+//g; s/[[:space:]]+/ /g; s/^ //; s/ $//')"
-        for option in quiet splash plymouth.ignore-serial-consoles logo.nologo vt.global_cursor_default=0; do
-          case " $cmdline " in
-            *" $option "*) ;;
-            *) cmdline="$cmdline $option" ;;
-          esac
-        done
-        printf '%s\n' "$cmdline" | sudo tee "$BOOT_CMDLINE" >/dev/null
-      else
-        warn 'No Raspberry Pi cmdline.txt found; boot text options were not changed.'
-      fi
-      ok 'Native Raspberry Pi OS pix boot splash installed'
-    fi
-  fi
-else
-  warn 'No boot image found in install/splash or bundle; skipping the splash step.'
-fi
-
-# --- 7) Raspberry Pi 5 onboard RTC -----------------------------------------
+# --- 6) Raspberry Pi 5 onboard RTC -----------------------------------------
 # The official rechargeable battery is NOT charged unless rtc_bbat_vchg is set
 # in config.txt, and without it the clock is lost on the next power cut.
 # Feeding/cleaning schedules depend on the clock, so configure it here.
@@ -298,6 +196,9 @@ case "$PI_MODEL" in
       if grep -qE '^[[:space:]]*dtparam=rtc_bbat_vchg=' "$BOOT_CONFIG"; then
         sudo sed -i -E "s|^[[:space:]]*dtparam=rtc_bbat_vchg=.*|dtparam=rtc_bbat_vchg=$RTC_CHARGE_UV|" "$BOOT_CONFIG"
       else
+        if [ -n "$(tail -c 1 "$BOOT_CONFIG")" ]; then
+          printf '\n' | sudo tee -a "$BOOT_CONFIG" >/dev/null
+        fi
         printf 'dtparam=rtc_bbat_vchg=%s\n' "$RTC_CHARGE_UV" | sudo tee -a "$BOOT_CONFIG" >/dev/null
       fi
       ok "RTC battery charging set to $RTC_CHARGE_UV uV in $BOOT_CONFIG (active after reboot)"
@@ -319,7 +220,7 @@ case "$PI_MODEL" in
     ;;
 esac
 
-# --- 8) launcher script, autostart, desktop shortcut, launch ---------------
+# --- 7) launcher script, autostart, desktop shortcut, launch ---------------
 step 'Creating launcher, autostart entry, desktop shortcut and starting the app'
 cat > "$APP_ROOT/start_pumpngrow.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -406,7 +307,7 @@ ok 'Labwc autostart registered: ~/.config/labwc/autostart'
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
 mkdir -p "$DESKTOP_DIR"
 DESKTOP_LAUNCHER="$DESKTOP_DIR/PumpnGrow.desktop"
-if [ -f "$APP_SPLASH_PNG" ]; then ICON_PATH="$APP_SPLASH_PNG"; else ICON_PATH="$BUNDLE_DIR/splash.png"; fi
+ICON_PATH="$BUNDLE_DIR/splash.png"
 cat > "$DESKTOP_LAUNCHER" <<EOF
 [Desktop Entry]
 Type=Application
@@ -433,3 +334,4 @@ ok 'PumpnGrow started in full screen'
 printf '\n%sSetup complete%s -- release %s\n' "$C_OK" "$C_END" "$RELEASE_TAG"
 printf 'Executable: %s\n' "$BUNDLE_DIR/pumpngrow"
 printf 'Reboot once to apply RS-485 (dialout) permissions and the RTC setting: sudo reboot\n'
+printf 'Boot screen was left untouched. Optional: bash ~/install/splash/apply_boot_splash.sh\n'
